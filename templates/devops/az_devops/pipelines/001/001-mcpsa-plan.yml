@@ -1,0 +1,117 @@
+# -----------------------------------------------
+# Azure DevOps Build Pipeline (CI)
+# Project   : Master Control Program
+# Repo      : MCPDevOps01
+# Pipeline  : 003_Pipeline_RG_MCPDevOps01_init
+# Purpose   : terraform init + validate + plan
+#             Ensures agent archive directory exists
+#             Publishes plan artifact for Release
+# -----------------------------------------------
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - AZ/McpSA/environments/dev/**
+
+pool:
+  name: 'MCP_VISH'
+
+variables:
+  - group: terraform-secret-vars   # ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID
+
+  - name: TF_WORKING_DIR
+    value: '$(System.DefaultWorkingDirectory)/terraform'
+
+  - name: TF_VERSION
+    value: '1.7.5'
+
+  # Agent-level state archive — shared path on VIDHYA for all deployments.
+  # main.tf uses backend "local" with this same path so terraform reads/writes
+  # state here automatically. No copy needed — backend handles it.
+  - name: TF_STATE_ARCHIVE
+    value: 'C:\terraform-state'
+
+  - name: TF_STATE_KEY
+    value: 'mcpdevops'
+
+stages:
+
+# -----------------------------------------------
+# STAGE 1 — Init + Validate + Plan
+# -----------------------------------------------
+- stage: TerraformPlan
+  displayName: 'Terraform Plan (CI)'
+  jobs:
+  - job: TerraformPlanJob
+    displayName: 'Init, Validate & Plan'
+    steps:
+
+    # Step 1: Install Terraform
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform $(TF_VERSION)'
+      inputs:
+        terraformVersion: '$(TF_VERSION)'
+
+    # Step 2: Prepare agent archive directory
+    #
+    # Creates C:\terraform-state\mcpdevops01\ if it doesn't exist.
+    # main.tf backend "local" uses this path — terraform reads/writes state here
+    # automatically on every pipeline run (build, apply, destroy).
+    # No file copy needed: the backend handles state directly.
+    - script: |
+        if not exist "$(TF_STATE_ARCHIVE)\$(TF_STATE_KEY)" (
+          mkdir "$(TF_STATE_ARCHIVE)\$(TF_STATE_KEY)"
+          echo [archive] Created directory $(TF_STATE_ARCHIVE)\$(TF_STATE_KEY)
+        ) else (
+          echo [archive] Directory exists: $(TF_STATE_ARCHIVE)\$(TF_STATE_KEY)
+        )
+        if exist "$(TF_STATE_ARCHIVE)\$(TF_STATE_KEY)\terraform.tfstate" (
+          echo [archive] State file found - plan will reflect current Azure state
+        ) else (
+          echo [archive] No state file - this is a fresh deployment
+        )
+      displayName: 'Prepare Agent State Archive'
+
+    # Step 3: Terraform Init
+    # -input=false: never prompt (prevents hang on backend migration confirmation).
+    # NOTE: script step used instead of TerraformTaskV4 init —
+    # TerraformTaskV4@4 v4.241.36 ignores backendType: local and demands
+    # backendServiceArm. See NOTE-016.
+    - script: terraform init -input=false
+      displayName: 'Terraform Init'
+      workingDirectory: '$(TF_WORKING_DIR)'
+
+    # Step 4: Terraform Validate
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Validate'
+      inputs:
+        provider: 'azurerm'
+        command: 'validate'
+        workingDirectory: '$(TF_WORKING_DIR)'
+        environmentServiceNameAzureRM: 'azure-sc-terraform'
+
+    # Step 5: Terraform Plan
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(TF_WORKING_DIR)'
+        commandOptions: >
+          -out=$(TF_WORKING_DIR)/tfplan
+          -var="client_id=$(ARM_CLIENT_ID)"
+          -var="client_secret=$(ARM_CLIENT_SECRET)"
+          -var="tenant_id=$(ARM_TENANT_ID)"
+          -var="subscription_id=$(ARM_SUBSCRIPTION_ID)"
+        environmentServiceNameAzureRM: 'azure-sc-terraform'
+
+    # Step 6: Publish artifact
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Terraform Plan Artifact'
+      inputs:
+        PathtoPublish: '$(TF_WORKING_DIR)'
+        ArtifactName: 'terraform-plan'
+        publishLocation: 'Container'
